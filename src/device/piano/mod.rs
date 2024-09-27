@@ -8,6 +8,7 @@ use std::{
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use log::{error, info, warn};
+use midir::{MidiInput, MidiOutput};
 use rodio::Sink;
 
 use crate::{bluetooth::A2DPSourceHandler, config, SharedRwLock};
@@ -323,4 +324,46 @@ where
             }
         }
     }
+}
+
+async fn debug_midi() {
+    let midi_in = MidiInput::new("client_name").unwrap();
+    let midi_in_port = midi_in.ports().into_iter().next().unwrap();
+
+    let midi_out = MidiOutput::new("client_name_2").unwrap();
+    let midi_out_port = midi_out.ports().into_iter().next().unwrap();
+
+    let in_connection = midi_in
+        .connect(
+            &midi_in_port,
+            "in_port_name",
+            move |stamp, msg, _| error!("MIDI_IN {}: {:?} (len = {})", stamp, msg, msg.len()),
+            (),
+        )
+        .unwrap();
+
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        in_connection.close();
+        error!("MIDI IN STOP");
+    });
+
+    let mut out_connection = midi_out.connect(&midi_out_port, "out_port_name").unwrap();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+
+        let mut play_note = |note: u8, duration: u64| {
+            const NOTE_ON_MSG: u8 = 0x90;
+            const NOTE_OFF_MSG: u8 = 0x80;
+            const VELOCITY: u8 = 0x64;
+            out_connection.send(&[NOTE_ON_MSG, note, VELOCITY]).unwrap();
+            std::thread::sleep(Duration::from_millis(duration));
+            out_connection
+                .send(&[NOTE_OFF_MSG, note, VELOCITY])
+                .unwrap();
+        };
+
+        play_note(66, 500);
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    });
 }
