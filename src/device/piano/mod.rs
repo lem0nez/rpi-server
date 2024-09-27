@@ -8,6 +8,7 @@ use std::{
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use log::{error, info, warn};
+use rodio::Sink;
 
 use crate::{bluetooth::A2DPSourceHandler, config, SharedRwLock};
 
@@ -221,7 +222,7 @@ async fn debug(device: cpal::Device) {
         error!("an error occurred on stream: {}", err);
     };
 
-    std::thread::spawn(move || {
+    tokio::task::spawn_blocking(move || {
         let stream = match device_config.sample_format() {
             cpal::SampleFormat::I8 => device_clone
                 .build_input_stream(
@@ -275,6 +276,36 @@ async fn debug(device: cpal::Device) {
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(3)).await;
         record_tx.send(()).unwrap();
+    });
+
+    let device_config = device.default_output_config().unwrap();
+    let shared_sink: SharedRwLock<Option<Sink>> = SharedRwLock::default();
+    let shared_sink_clone = Arc::clone(&shared_sink);
+    tokio::task::spawn_blocking(move || {
+        let (_stream, handle) =
+            rodio::OutputStream::try_from_device_config(&device, device_config).unwrap();
+        let sink = rodio::Sink::try_new(&handle).unwrap();
+
+        sink.append(
+            rodio::Decoder::new(std::io::BufReader::new(
+                std::fs::File::open("/tmp/piano-song.flac").unwrap(),
+            ))
+            .unwrap(),
+        );
+        *shared_sink_clone.blocking_write() = Some(sink);
+        error!("PLAYING");
+        shared_sink_clone
+            .blocking_read()
+            .as_ref()
+            .unwrap()
+            .sleep_until_end();
+        error!("PLAY STOPPED");
+    });
+
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        shared_sink.read().await.as_ref().unwrap().stop();
+        error!("STOP SENT");
     });
 }
 
