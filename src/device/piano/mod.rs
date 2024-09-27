@@ -1,6 +1,12 @@
-use std::{ffi::OsString, sync::Arc, time::Duration};
+use std::{
+    ffi::OsString,
+    fs::File,
+    io::BufWriter,
+    sync::{mpsc::channel, Arc},
+    time::Duration,
+};
 
-use cpal::traits::{DeviceTrait, HostTrait};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use log::{error, info, warn};
 
 use crate::{bluetooth::A2DPSourceHandler, config, SharedRwLock};
@@ -127,6 +133,7 @@ impl Piano {
                         inner.device = self_clone.find_audio_device();
                         if inner.device.is_some() {
                             info!("Audio device set");
+                            debug(inner.device.clone().unwrap()).await;
                         } else {
                             error!("Audio device is not found");
                         }
@@ -187,4 +194,102 @@ struct InnerInitialized {
     devpath: OsString,
     /// Will be [None] if the audio device is in use now.
     device: Option<cpal::Device>,
+}
+
+async fn debug(device: cpal::Device) {
+    let device_clone = device.clone();
+    let (record_tx, record_rx) = channel();
+
+    let device_config = device_clone.default_input_config().unwrap();
+
+    let wav_spec = hound::WavSpec {
+        channels: device_config.channels(),
+        sample_rate: device_config.sample_rate().0 as _,
+        bits_per_sample: (device_config.sample_format().sample_size() * 8) as _,
+        sample_format: if device_config.sample_format().is_float() {
+            hound::SampleFormat::Float
+        } else {
+            hound::SampleFormat::Int
+        },
+    };
+    let wav_writer = Arc::new(std::sync::Mutex::new(Some(
+        hound::WavWriter::create("/tmp/piano-record.wav", wav_spec).unwrap(),
+    )));
+    let wav_writer_clone = wav_writer.clone();
+
+    let err_fn = |err| {
+        error!("an error occurred on stream: {}", err);
+    };
+
+    std::thread::spawn(move || {
+        let stream = match device_config.sample_format() {
+            cpal::SampleFormat::I8 => device_clone
+                .build_input_stream(
+                    &device_config.into(),
+                    move |data, _| write_input_data::<i8>(data, &wav_writer_clone),
+                    err_fn,
+                    None,
+                )
+                .unwrap(),
+            cpal::SampleFormat::I16 => device_clone
+                .build_input_stream(
+                    &device_config.into(),
+                    move |data, _| write_input_data::<i16>(data, &wav_writer_clone),
+                    err_fn,
+                    None,
+                )
+                .unwrap(),
+            cpal::SampleFormat::I32 => device_clone
+                .build_input_stream(
+                    &device_config.into(),
+                    move |data, _| write_input_data::<i32>(data, &wav_writer_clone),
+                    err_fn,
+                    None,
+                )
+                .unwrap(),
+            cpal::SampleFormat::F32 => device_clone
+                .build_input_stream(
+                    &device_config.into(),
+                    move |data, _| write_input_data::<f32>(data, &wav_writer_clone),
+                    err_fn,
+                    None,
+                )
+                .unwrap(),
+            _ => panic!("unsupported sample format"),
+        };
+
+        error!("Recording...");
+        stream.play().unwrap();
+        record_rx.recv().unwrap();
+        drop(stream);
+        wav_writer
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .finalize()
+            .unwrap();
+        error!("Recorded");
+    });
+
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        record_tx.send(()).unwrap();
+    });
+}
+
+type WavWriterHandle = Arc<std::sync::Mutex<Option<hound::WavWriter<BufWriter<File>>>>>;
+
+fn write_input_data<T>(input: &[T], writer: &WavWriterHandle)
+where
+    T: cpal::Sample + hound::Sample,
+{
+    if let Ok(mut guard) = writer.try_lock() {
+        if let Some(writer) = guard.as_mut() {
+            for &sample in input.iter() {
+                let sample = T::from_sample(sample);
+                writer.write_sample(sample).ok();
+            }
+        }
+    }
 }
