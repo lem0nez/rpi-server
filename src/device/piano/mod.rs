@@ -2,14 +2,20 @@ use std::{
     ffi::OsString,
     fs::File,
     io::BufWriter,
-    sync::{mpsc::channel, Arc},
-    time::Duration,
+    path::Path,
+    sync::{Arc, Mutex, RwLock},
+    time::{Duration, Instant},
 };
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+    SampleFormat, SampleRate,
+};
+use flac_bound::FlacEncoder;
 use log::{error, info, warn};
 use midir::{MidiInput, MidiOutput};
 use rodio::Sink;
+use tokio::sync::mpsc::channel;
 
 use crate::{bluetooth::A2DPSourceHandler, config, SharedRwLock};
 
@@ -62,6 +68,12 @@ impl Piano {
 
         let event_type = event.event_type();
         if event_type == tokio_udev::EventType::Add {
+            error!("{}", event.syspath().to_string_lossy());
+            if event.syspath().to_string_lossy().ends_with("/midi2") {
+                // debug_midi().await;
+                return None;
+            }
+
             let id_matches = event
                 .attribute_value("id")
                 .map(|id| id.to_string_lossy() == self.config.device_id)
@@ -200,83 +212,57 @@ struct InnerInitialized {
 
 async fn debug(device: cpal::Device) {
     let device_clone = device.clone();
-    let (record_tx, record_rx) = channel();
+    let (record_tx, mut record_rx) = channel::<Vec<i32>>(128);
 
-    let device_config = device_clone.default_input_config().unwrap();
-
-    let wav_spec = hound::WavSpec {
-        channels: device_config.channels(),
-        sample_rate: device_config.sample_rate().0 as _,
-        bits_per_sample: (device_config.sample_format().sample_size() * 8) as _,
-        sample_format: if device_config.sample_format().is_float() {
-            hound::SampleFormat::Float
-        } else {
-            hound::SampleFormat::Int
-        },
-    };
-    let wav_writer = Arc::new(std::sync::Mutex::new(Some(
-        hound::WavWriter::create("/tmp/piano-record.wav", wav_spec).unwrap(),
-    )));
-    let wav_writer_clone = wav_writer.clone();
-
-    let err_fn = |err| {
-        error!("an error occurred on stream: {}", err);
-    };
+    let device_config = device_clone
+        .supported_input_configs()
+        .unwrap()
+        .find(|config| config.channels() == 2 && config.sample_format() == SampleFormat::I32)
+        .unwrap()
+        .try_with_sample_rate(SampleRate(44_100))
+        .unwrap();
 
     tokio::task::spawn_blocking(move || {
-        let stream = match device_config.sample_format() {
-            cpal::SampleFormat::I8 => device_clone
-                .build_input_stream(
-                    &device_config.into(),
-                    move |data, _| write_input_data::<i8>(data, &wav_writer_clone),
-                    err_fn,
-                    None,
-                )
-                .unwrap(),
-            cpal::SampleFormat::I16 => device_clone
-                .build_input_stream(
-                    &device_config.into(),
-                    move |data, _| write_input_data::<i16>(data, &wav_writer_clone),
-                    err_fn,
-                    None,
-                )
-                .unwrap(),
-            cpal::SampleFormat::I32 => device_clone
-                .build_input_stream(
-                    &device_config.into(),
-                    move |data, _| write_input_data::<i32>(data, &wav_writer_clone),
-                    err_fn,
-                    None,
-                )
-                .unwrap(),
-            cpal::SampleFormat::F32 => device_clone
-                .build_input_stream(
-                    &device_config.into(),
-                    move |data, _| write_input_data::<f32>(data, &wav_writer_clone),
-                    err_fn,
-                    None,
-                )
-                .unwrap(),
-            _ => panic!("unsupported sample format"),
-        };
+        let mut outf = File::create("/tmp/piano-record.flac").unwrap();
+        let mut wrap = flac_bound::WriteWrapper(&mut outf);
+        let mut encoder = FlacEncoder::new()
+            .unwrap()
+            .channels(device_config.channels() as _)
+            .bits_per_sample((device_config.sample_format().sample_size() * 8) as _)
+            .sample_rate(device_config.sample_rate().0)
+            .init_write(&mut wrap)
+            .unwrap();
+
+        let stream = device_clone
+            .build_input_stream(
+                &device_config.clone().into(),
+                move |data: &[i32], _| {
+                    record_tx.blocking_send(data.to_vec()).unwrap();
+                },
+                |err| error!("an error occurred on stream: {}", err),
+                None,
+            )
+            .unwrap();
 
         error!("Recording...");
         stream.play().unwrap();
-        record_rx.recv().unwrap();
-        drop(stream);
-        wav_writer
-            .lock()
-            .unwrap()
-            .take()
-            .unwrap()
-            .finalize()
-            .unwrap();
+        let instant = Instant::now();
+
+        while let Some(data) = record_rx.blocking_recv() {
+            if instant.elapsed() > Duration::from_secs(3) {
+                encoder.finish().unwrap();
+                drop(stream);
+                break;
+            } else {
+                encoder.process_interleaved(&data, (data.len() / 2) as _).unwrap();
+            }
+        }
         error!("Recorded");
     });
 
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(3)).await;
-        record_tx.send(()).unwrap();
+        // record_tx.send(()).unwrap();
     });
 
     let device_config = device.default_output_config().unwrap();
@@ -314,13 +300,13 @@ type WavWriterHandle = Arc<std::sync::Mutex<Option<hound::WavWriter<BufWriter<Fi
 
 fn write_input_data<T>(input: &[T], writer: &WavWriterHandle)
 where
-    T: cpal::Sample + hound::Sample,
+    T: cpal::Sample<Float = f32> + hound::Sample,
 {
     if let Ok(mut guard) = writer.try_lock() {
         if let Some(writer) = guard.as_mut() {
             for &sample in input.iter() {
                 let sample = T::from_sample(sample);
-                writer.write_sample(sample).ok();
+                writer.write_sample(sample.mul_amp(10.0)).ok();
             }
         }
     }
@@ -328,10 +314,31 @@ where
 
 async fn debug_midi() {
     let midi_in = MidiInput::new("client_name").unwrap();
-    let midi_in_port = midi_in.ports().into_iter().next().unwrap();
+    for port in midi_in.ports() {
+        error!("PORT: {}", midi_in.port_name(&port).unwrap());
+    }
+    let midi_in_port = midi_in
+        .ports()
+        .into_iter()
+        .find(|port| {
+            midi_in
+                .port_name(port)
+                .map(|name| name.contains("SOUND"))
+                .unwrap_or(false)
+        })
+        .unwrap();
 
     let midi_out = MidiOutput::new("client_name_2").unwrap();
-    let midi_out_port = midi_out.ports().into_iter().next().unwrap();
+    let midi_out_port = midi_out
+        .ports()
+        .into_iter()
+        .find(|port| {
+            midi_out
+                .port_name(port)
+                .map(|name| name.contains("SOUND"))
+                .unwrap_or(false)
+        })
+        .unwrap();
 
     let in_connection = midi_in
         .connect(
@@ -357,13 +364,17 @@ async fn debug_midi() {
             const NOTE_OFF_MSG: u8 = 0x80;
             const VELOCITY: u8 = 0x64;
             out_connection.send(&[NOTE_ON_MSG, note, VELOCITY]).unwrap();
+            error!("MIDI SEND");
             std::thread::sleep(Duration::from_millis(duration));
             out_connection
                 .send(&[NOTE_OFF_MSG, note, VELOCITY])
                 .unwrap();
         };
 
-        play_note(66, 500);
+        play_note(36, 50);
+        play_note(36, 50);
+        play_note(36, 50);
+        play_note(36, 50);
         tokio::time::sleep(Duration::from_secs(60)).await;
     });
 }
